@@ -560,9 +560,10 @@ configure_x11() {
         exit 1
     fi
 
-    # Convert from domain:bus:device.function to PCI:bus:device:function format
-    # lspci shows: 000f:01:00.0 -> we need: PCI:15:1:0
-    # Extract components
+    # Convert from domain:bus:device.function to Xorg PCI BusID format
+    # lspci -D shows: 000f:01:00.0
+    # Xorg format with domain: PCI:bus@domain:device:function
+    # When domain is 0, the simpler PCI:bus:device:function works too
     local domain bus device func
     domain=$(echo "${bus_id}" | cut -d: -f1)
     bus=$(echo "${bus_id}" | cut -d: -f2)
@@ -585,10 +586,17 @@ configure_x11() {
     device=$((16#${device}))
     func=$((16#${func}))
 
-    local pci_bus_id="PCI:${bus}:${device}:${func}"
+    # Use domain-aware format (PCI:bus@domain:device:function) when domain != 0
+    # DGX Spark GPU is at PCI domain 0x0f (15), not domain 0
+    local pci_bus_id
+    if [[ ${domain} -ne 0 ]]; then
+        pci_bus_id="PCI:${bus}@${domain}:${device}:${func}"
+    else
+        pci_bus_id="PCI:${bus}:${device}:${func}"
+    fi
 
     # Validate BusID format for safe sed substitution
-    if [[ ! "${pci_bus_id}" =~ ^PCI:[0-9]+:[0-9]+:[0-9]+$ ]]; then
+    if [[ ! "${pci_bus_id}" =~ ^PCI:[0-9]+(@[0-9]+)?:[0-9]+:[0-9]+$ ]]; then
         log_error "Invalid BusID format generated: ${pci_bus_id}"
         exit 1
     fi
@@ -624,9 +632,18 @@ configure_x11() {
 configure_permissions() {
     log_step "Configuring Permissions"
 
-    log_substep "Adding current user to 'video' and 'input' groups..."
-    sudo usermod -aG video,input "${USER}"
-    log_success "User added to groups"
+    log_substep "Adding current user to 'video', 'render', and 'input' groups..."
+    # 'render' group is required for GPU access (/dev/dri/renderD128)
+    # 'video' group is required for /dev/dri/card0 access
+    # 'input' group is required for input device forwarding
+    local groups_to_add="video,input"
+    if getent group render &>/dev/null; then
+        groups_to_add="video,render,input"
+    else
+        log_warning "'render' group does not exist - GPU access may require manual configuration"
+    fi
+    sudo usermod -aG "${groups_to_add}" "${USER}"
+    log_success "User added to groups: ${groups_to_add}"
 
     # NOTE: uinput access allows Sunshine to forward remote input (keyboard/mouse).
     # This grants the logged-in user the ability to create virtual input devices.
@@ -889,6 +906,85 @@ configure_tailscale() {
 }
 
 # ============================================================================
+# Desktop Session Configuration (GDM Auto-Login, X11, .xprofile)
+# ============================================================================
+configure_desktop_session() {
+    log_step "Configuring Desktop Session"
+
+    # --- GDM Auto-Login & Force X11 ---
+    local gdm_conf="/etc/gdm3/custom.conf"
+    if [[ ! -f "${gdm_conf}" ]]; then
+        gdm_conf="/etc/gdm/custom.conf"
+    fi
+
+    if [[ -f "${gdm_conf}" ]]; then
+        log_substep "Configuring GDM for headless operation..."
+
+        # Backup GDM config
+        if [[ -d "${BACKUP_DIR}" ]]; then
+            sudo cp "${gdm_conf}" "${BACKUP_DIR}/gdm-custom.conf" 2>/dev/null || true
+        fi
+
+        # Force X11 (disable Wayland) - Sunshine requires X11 for screen capture
+        if grep -q "^#.*WaylandEnable=false" "${gdm_conf}" 2>/dev/null; then
+            sudo sed -i 's|^#.*WaylandEnable=false|WaylandEnable=false|' "${gdm_conf}"
+            log_success "Wayland disabled (X11 forced) - required for Sunshine"
+        elif ! grep -q "^WaylandEnable=false" "${gdm_conf}" 2>/dev/null; then
+            sudo sed -i '/^\[daemon\]/a WaylandEnable=false' "${gdm_conf}"
+            log_success "Wayland disabled (X11 forced) - required for Sunshine"
+        else
+            log_success "Wayland already disabled"
+        fi
+
+        # Enable auto-login for headless operation
+        echo ""
+        log_warning "Headless operation requires GDM auto-login"
+        log_substep "Without auto-login, no X11 session exists after reboot and Sunshine"
+        log_substep "cannot capture the screen."
+        echo ""
+        if confirm "Enable GDM auto-login for '${USER}'?"; then
+            # Check if auto-login is already configured
+            if grep -q "^AutomaticLoginEnable=true" "${gdm_conf}" 2>/dev/null && \
+               grep -q "^AutomaticLogin=${USER}" "${gdm_conf}" 2>/dev/null; then
+                log_success "Auto-login already configured for ${USER}"
+            else
+                # Remove any existing auto-login lines (commented or not) to avoid duplicates
+                # Handles both "AutomaticLogin=user" and "AutomaticLogin = user" formats
+                sudo sed -i '/^[# ]*AutomaticLoginEnable/d' "${gdm_conf}"
+                sudo sed -i '/^[# ]*AutomaticLogin[[:space:]]*=/d' "${gdm_conf}"
+                # Add auto-login after [daemon] section
+                sudo sed -i "/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=${USER}" "${gdm_conf}"
+                log_success "GDM auto-login enabled for ${USER}"
+            fi
+        else
+            log_warning "Skipping auto-login - you will need to log in manually after each reboot"
+            log_substep "Without a graphical session, Sunshine will not be able to capture the screen"
+        fi
+    else
+        log_warning "GDM configuration not found - auto-login must be configured manually"
+        log_substep "Sunshine requires a graphical X11 session to capture"
+    fi
+
+    # --- Create ~/.xprofile for DISPLAY/XAUTHORITY export ---
+    log_substep "Configuring X session environment export..."
+    local xprofile="${HOME}/.xprofile"
+    local xprofile_line="dbus-update-activation-environment --systemd DISPLAY XAUTHORITY"
+
+    if [[ -f "${xprofile}" ]] && grep -qF "${xprofile_line}" "${xprofile}" 2>/dev/null; then
+        log_success ".xprofile already exports DISPLAY/XAUTHORITY to systemd"
+    else
+        cat >> "${xprofile}" <<EOF
+# Export X11 session variables to systemd user manager
+# Required for Sunshine to access the display
+${xprofile_line}
+EOF
+        log_success "Created/updated ~/.xprofile for DISPLAY/XAUTHORITY export"
+    fi
+
+    log_complete
+}
+
+# ============================================================================
 # Post-Install Validation
 # ============================================================================
 validate_installation() {
@@ -1026,6 +1122,7 @@ main() {
     configure_x11
     configure_permissions
     configure_sunshine
+    configure_desktop_session
     validate_installation
     configure_tailscale
 
